@@ -8,7 +8,8 @@ using System.Xml;
 using System.Xml.XPath;
 
 using MimeSharp;
-using OfficeOpenXml;
+using CsvHelper;
+using System.Linq;
 
 namespace FogBugzImporter
 {
@@ -22,11 +23,11 @@ namespace FogBugzImporter
 
         static char[] m_attachmentSeparator = new char[] { ';' };
 
-        string m_url;
-        string m_name;
-        string m_password;
-        string m_ticketsFile;
-        string m_mediaDir;
+        string fogbugzServiceUri;
+        string userEmail;
+        string userPassword;
+        string caseFile;
+        string attachmentDirectory;
 
         bool m_seenResolve;
         bool m_seenClose;
@@ -38,29 +39,36 @@ namespace FogBugzImporter
 
         Mime mimeDetector = new Mime();
 
-        public Importer(string url, string name, string password, string ticketsFile, string mediaDir)
+        public Importer(string fogbugzServiceUri, string fogbugzUserEmail, string fogbugzUserPassword, string caseFile, string attachmentDirectory)
         {
-            m_url = url;
-            m_name = name;
-            m_password = password;
-            m_ticketsFile = ticketsFile;
-            m_mediaDir = mediaDir;
+            this.fogbugzServiceUri = fogbugzServiceUri;
+            this.userEmail = fogbugzUserEmail;
+            this.userPassword = fogbugzUserPassword;
+            this.caseFile = caseFile;
+            this.attachmentDirectory = attachmentDirectory;
         }
 
         public void Connect()
         {
             Dictionary<string, string> args = new Dictionary<string, string>();
             args.Add("cmd", "logon");
-            args.Add("email", m_name);
-            args.Add("password", m_password);
+            args.Add("email", userEmail);
+            args.Add("password", userPassword);
 
-            string result = CallRESTAPIFiles(m_url, args, null);
+            string result = CallRESTAPIFiles(fogbugzServiceUri, args, null);
 
-            XmlTextReader reader = new XmlTextReader(new StringReader(result));
-            XPathDocument doc = new XPathDocument(reader);
-            XPathNavigator nav = doc.CreateNavigator();
+            try
+            {
+                XmlTextReader reader = new XmlTextReader(new StringReader(result));
+                XPathDocument doc = new XPathDocument(reader);
+                XPathNavigator nav = doc.CreateNavigator();
 
-            m_token = nav.Evaluate("string(response/token)").ToString();
+                m_token = nav.Evaluate("string(response/token)").ToString();
+
+            } catch (Exception ex){
+                Console.WriteLine($"Exception connecting to FogBugz: {ex}");
+                return;
+            }
 
             loadPeople();
         }
@@ -69,82 +77,91 @@ namespace FogBugzImporter
         {
             m_log = new StringBuilder();
 
-            FileInfo existingFile = new FileInfo(m_ticketsFile);
-            using (ExcelPackage pkg = new ExcelPackage(existingFile))
+            FileInfo existingFile = new FileInfo(caseFile);
+            using (var fileReader = new StreamReader(existingFile.OpenRead()))
             {
-                ExcelWorksheet worksheet = pkg.Workbook.Worksheets[1];
-                int row = 2;
+                using (var csvReader = new CsvReader(fileReader))
+                {                    
+                    List<string> headers = null;
+                    if (csvReader.ReadHeader()){
+                        headers = csvReader.FieldHeaders.ToList();
+                    } else {
+                        Console.WriteLine("Could not read headers. Exiting");
+                        return;
+                    }
 
-                string cmd = getCellValue(worksheet, row, 1);
-                while (!string.IsNullOrEmpty(cmd))
-                {
-                    string dt = getCellValue(worksheet, row, 2);
-                    string sProject = getCellValue(worksheet, row, 3);
-                    string sArea = getCellValue(worksheet, row, 4);
-                    string sFixFor = getCellValue(worksheet, row, 5);
-                    string ixPriority = getCellValue(worksheet, row, 6);
-                    string sTitle = getCellValue(worksheet, row, 7);
-                    string sEvent = getCellValue(worksheet, row, 8);
-                    string sPersonAssignedTo = getCellValue(worksheet, row, 9);
-                    string dtDue = getCellValue(worksheet, row, 10);
-                    string reporter = getCellValue(worksheet, row, 11);
-                    string attachments = getCellValue(worksheet, row, 12);
+                    var headerCount = headers.Count();
+                    while (csvReader.Read())
+                    {
+                        var record = csvReader.CurrentRecord;
 
-                    if (cmd == "close" && !m_seenResolve)
-                        executeCommand("resolve", dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
+                        var case = new Dictionary<String, String>(headers.Zip(record, (k, v) => new KeyValuePair<String, String>(k, v))
+                                                                .Where(kp => !String.IsNullOrWhiteSpace((kp.Value))));
+                        
+			  
+                        //Dumb version:
+                        //var ticketMap = Enumerable.Range(0, headerCount).ToDictionary(i => headers[i], i => record[i]);
+                    }
+                    /*
+                    int row = 2;
 
-                    if (cmd == "reopen" && !m_seenClose)
-                        cmd = "reactivate";
+                    string cmd = getCellValue(worksheet, row, 1);
+                    while (!string.IsNullOrEmpty(cmd))
+                    {
+                        string dt = getCellValue(worksheet, row, 2);
+                        string sProject = getCellValue(worksheet, row, 3);
+                        string sArea = getCellValue(worksheet, row, 4);
+                        string sFixFor = getCellValue(worksheet, row, 5);
+                        string ixPriority = getCellValue(worksheet, row, 6);
+                        string sTitle = getCellValue(worksheet, row, 7);
+                        string sEvent = getCellValue(worksheet, row, 8);
+                        string sPersonAssignedTo = getCellValue(worksheet, row, 9);
+                        string dtDue = getCellValue(worksheet, row, 10);
+                        string reporter = getCellValue(worksheet, row, 11);
+                        string attachments = null;//getCellValue(worksheet, row, 12);
 
-                    executeCommand(cmd, dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
+                        if (cmd == "close" && !m_seenResolve)
+                            executeCommand("resolve", dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
 
-                    Console.WriteLine(string.Format("Processed {0} row", row));
+                        if (cmd == "reopen" && !m_seenClose)
+                            cmd = "reactivate";
 
-                    row++;
-                    cmd = getCellValue(worksheet, row, 1);
+                        //executeCommand(cmd, dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
+
+                        Console.WriteLine(string.Format("Processed {0} row", row));
+
+                        row++;
+                        cmd = getCellValue(worksheet, row, 1);
+                    }*/
                 }
             }
 
             File.WriteAllText("log.xml", m_log.ToString(), Encoding.Unicode);
         }
 
-        private void executeCommand(string cmd, string dt, string sProject, string sArea, string sFixFor,
+		/*private void executeCommand(string cmd, string dt, string sProject, string sArea, string sFixFor,
             string ixPriority, string sTitle, string sEvent, string sPersonAssignedTo, string dtDue,
             string reporter, string attachments)
+            */
+        void executeCommand(Dictionary<String,String> caseData)
         {
+            var cmd = caseData["cmd"];
             if (cmd != "new" && string.IsNullOrEmpty(m_lastBug))
                 throw new InvalidOperationException("Possibly invalid tickets file.");
 
-            Dictionary<string, string> args = new Dictionary<string, string>();
-            args.Add("cmd", cmd);
-            args.Add("token", m_token);
+            caseData.Add("token", m_token);
 
             if (cmd != "new")
-                args.Add("ixBug", m_lastBug);
-            if (!string.IsNullOrEmpty(dt))
-                args.Add("dt", dt);
+                caseData.Add("ixBug", m_lastBug);
 
+            var reporter = caseData["reporter"];
+            caseData.Remove("reporter");
             string personId = getPersonId(reporter);
             if (!string.IsNullOrEmpty(personId))
-                args.Add("ixPersonEditedBy", personId);
+                caseData.Add("ixPersonEditedBy", personId);
 
-            if (!string.IsNullOrEmpty(sTitle))
-                args.Add("sTitle", sTitle);
-            if (!string.IsNullOrEmpty(sProject))
-                args.Add("sProject", sProject);
-            if (!string.IsNullOrEmpty(sArea))
-                args.Add("sArea", sArea);
-            if (!string.IsNullOrEmpty(sFixFor))
-                args.Add("sFixFor", sFixFor);
-            if (!string.IsNullOrEmpty(sPersonAssignedTo))
-                args.Add("sPersonAssignedTo", sPersonAssignedTo);
-            if (!string.IsNullOrEmpty(ixPriority))
-                args.Add("ixPriority", ixPriority);
-            if (!string.IsNullOrEmpty(dtDue))
-                args.Add("dtDue", dtDue);
-            if (!string.IsNullOrEmpty(sEvent))
-                args.Add("sEvent", sEvent);
-
+            var attachments = caseData["attachments"];
+            caseData.Remove("attachments");
             List<Attachment> files = getAttachments(attachments);
             ASCIIEncoding encoding = new ASCIIEncoding();
             Dictionary<string, byte[]>[] rgFiles = null;
@@ -157,15 +174,15 @@ namespace FogBugzImporter
                     rgFiles[i]["name"] = encoding.GetBytes("File" + (i + 1).ToString());
                     rgFiles[i]["filename"] = encoding.GetBytes(files[i].name);
                     rgFiles[i]["contenttype"] = encoding.GetBytes(mimeDetector.Lookup(files[i].name));
-                    FileStream fs = new FileStream(Path.Combine(m_mediaDir, files[i].nameOnDisk), FileMode.Open);
+                    FileStream fs = new FileStream(Path.Combine(attachmentDirectory, files[i].nameOnDisk), FileMode.Open);
                     BinaryReader br = new BinaryReader(fs);
                     rgFiles[i]["data"] = br.ReadBytes((int)fs.Length);
                     fs.Close();
                 }
-                args.Add("nFileCount", files.Count.ToString());
+                caseData.Add("nFileCount", files.Count.ToString());
             }
 
-            string result = CallRESTAPIFiles(m_url, args, rgFiles);
+            string result = CallRESTAPIFiles(fogbugzServiceUri, caseData, rgFiles);
             if (cmd == "new")
             {
                 XmlTextReader reader = new XmlTextReader(new StringReader(result));
@@ -215,22 +232,13 @@ namespace FogBugzImporter
             return null;
         }
 
-        private string getCellValue(ExcelWorksheet worksheet, int row, int column)
-        {
-            object o = worksheet.Cells[row, column].Value;
-            if (o == null)
-                return null;
-
-            return o.ToString();
-        }
-
         private void loadPeople()
         {
             Dictionary<string, string> args = new Dictionary<string, string>();
             args.Add("cmd", "listPeople");
             args.Add("token", m_token);
 
-            string result = CallRESTAPIFiles(m_url, args, null);
+            string result = CallRESTAPIFiles(fogbugzServiceUri, args, null);
             XmlTextReader reader = new XmlTextReader(new StringReader(result));
             XPathDocument doc = new XPathDocument(reader);
             XPathNavigator nav = doc.CreateNavigator();
@@ -260,7 +268,7 @@ namespace FogBugzImporter
             string sBoundary = "--" + sBoundaryString;
             ASCIIEncoding encoding = new ASCIIEncoding();
             UTF8Encoding utf8encoding = new UTF8Encoding();
-            HttpWebRequest http = (HttpWebRequest)HttpWebRequest.Create(sURL);
+            HttpWebRequest http = (HttpWebRequest)WebRequest.Create(sURL);
             http.Method = "POST";
             http.AllowWriteStreamBuffering = true;
             http.ContentType = "multipart/form-data; boundary=" + sBoundaryString;

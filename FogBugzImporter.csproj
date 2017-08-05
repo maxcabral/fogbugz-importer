@@ -16,7 +16,7 @@
     <RepositoryType>git</RepositoryType>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="EPPlus" Version="4.1.0" />
+    <PackageReference Include="CsvHelper" Version="2.16.3.0" />
     <PackageReference Include="MimeSharp" Version="1.0.0" />
   </ItemGroup>
 </Project>

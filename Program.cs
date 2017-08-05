@@ -9,6 +9,12 @@ namespace FogBugzImporter
     {
         static void Main(string[] args)
         {
+#if DEBUG
+            string url = "http://localhost:8080";
+			string name = "max";
+			string password = "pass";
+			string ticketsFile = "/Users/Max/Desktop/Import.csv";
+#else
             if (args.Length < 4)
             {
                 Console.WriteLine("Usage: URL Username Password TicketsFile.\n");
@@ -20,8 +26,9 @@ namespace FogBugzImporter
             string name = args[1];
             string password = args[2];
             string ticketsFile = args[3];
+#endif
 
-            if (!File.Exists(ticketsFile))
+			if (!File.Exists(ticketsFile))
             {
                 Console.WriteLine("Tickets file not found.\n");
                 return;
@@ -33,11 +40,11 @@ namespace FogBugzImporter
             if (!Directory.Exists(mediaDir))
             {
                 Console.WriteLine("Directory with attachments data not found.\n");
-                return;
+                //return;
             }
 
             Importer importer = new Importer(url, name, password, ticketsFile, mediaDir);
-            importer.Connect();
+            //importer.Connect();
             importer.Import();
         }
     }
