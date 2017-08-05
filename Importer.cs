@@ -1,14 +1,13 @@
-﻿using System;
+using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.IO;
+using System.Net;
 using System.Text;
 using System.Xml;
 using System.Xml.XPath;
-using System.IO;
-using System.Net;
-using System.Collections;
-using System.Security.Permissions;
-using Microsoft.Win32;
 
+using MimeSharp;
 using OfficeOpenXml;
 
 namespace FogBugzImporter
@@ -36,6 +35,8 @@ namespace FogBugzImporter
         string m_token;
         Dictionary<string, string> m_people = new Dictionary<string, string>();
         StringBuilder m_log;
+
+        Mime mimeDetector = new Mime();
 
         public Importer(string url, string name, string password, string ticketsFile, string mediaDir)
         {
@@ -155,7 +156,7 @@ namespace FogBugzImporter
                     rgFiles[i] = new Dictionary<string, byte[]>();
                     rgFiles[i]["name"] = encoding.GetBytes("File" + (i + 1).ToString());
                     rgFiles[i]["filename"] = encoding.GetBytes(files[i].name);
-                    rgFiles[i]["contenttype"] = encoding.GetBytes(GetMIMEType(files[i].name));
+                    rgFiles[i]["contenttype"] = encoding.GetBytes(mimeDetector.Lookup(files[i].name));
                     FileStream fs = new FileStream(Path.Combine(m_mediaDir, files[i].nameOnDisk), FileMode.Open);
                     BinaryReader br = new BinaryReader(fs);
                     rgFiles[i]["data"] = br.ReadBytes((int)fs.Length);
@@ -237,7 +238,7 @@ namespace FogBugzImporter
             string resultsTag = "response/people/person";
             string ixName = "ixPerson";
             string sName = "sFullName";
-            
+
             XPathNodeIterator nl = (XPathNodeIterator)nav.Evaluate(resultsTag);
             foreach (System.Xml.XPath.XPathNavigator n in nl)
             {
@@ -349,24 +350,6 @@ namespace FogBugzImporter
                 s += chars.Substring(rnum, 1);
             }
             return s;
-        }
-
-        // From http://www.codeproject.com/dotnet/ContentType.asp
-        private string GetMIMEType(string filepath)
-        {
-            RegistryPermission regPerm = new RegistryPermission(RegistryPermissionAccess.Read, "\\\\HKEY_CLASSES_ROOT");
-            FileInfo fi = new FileInfo(filepath);
-            RegistryKey classesRoot = Registry.ClassesRoot;
-            string dotExt = fi.Extension.ToLower();
-            RegistryKey typeKey = classesRoot.OpenSubKey("MIME\\Database\\Content Type");
-
-            foreach (string keyname in typeKey.GetSubKeyNames())
-            {
-                RegistryKey curKey = classesRoot.OpenSubKey("MIME\\Database\\Content Type\\" + keyname);
-                if (curKey.GetValue("Extension") != null && curKey.GetValue("Extension").ToString().ToLower() == dotExt)
-                    return keyname;
-            }
-            return "";
         }
     }
 }
