@@ -20,7 +20,7 @@ namespace FogBugzImporter
 
         static void Main(string[] args)
         {
-            //ProcessOptions(args);
+            ProcessOptions(args);
 
             var driver = new FogBugzDriver(url, token);
             try
@@ -54,7 +54,7 @@ namespace FogBugzImporter
 				{ "p|password=", "Your FogBugz Login Password", p => password = p },
 				{ "t|token=", "Your FogBugz API Token (recommended)", t => token = t },
 				{ "u|api-url=", "Your FogBugz API Url, i.e. https://example.fogbugz.com/api.asp", u => url = u },
-				{ "i|import", "A path to a file to import. Multiple files may be specified.", f => ticketsFiles.Add(f) },
+				{ "i|import=", "A path to a file to import. Multiple files may be specified.", f => ticketsFiles.Add(f) },
 				{ "f|force", "Ignore most errors", f => force = f != null },
 				{ "v|verbose", "Increase debug message verbosity", v => verbose = v != null },
 				{ "h|help", "Show this message and exit", h => shouldShowHelp = h != null },
