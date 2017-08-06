@@ -18,5 +18,6 @@
   <ItemGroup>
     <PackageReference Include="CsvHelper" Version="2.16.3.0" />
     <PackageReference Include="MimeSharp" Version="1.0.0" />
+    <PackageReference Include="Mono.Options" Version="5.3.0.1" />
   </ItemGroup>
 </Project>

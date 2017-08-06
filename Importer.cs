@@ -10,82 +10,51 @@ using System.Xml.XPath;
 using MimeSharp;
 using CsvHelper;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace FogBugzImporter
 {
+	struct Attachment
+	{
+		public string name;
+		public string nameOnDisk;
+	}
+
     class Importer
     {
-        struct Attachment
-        {
-            public string name;
-            public string nameOnDisk;
-        }
-
-        static char[] m_attachmentSeparator = new char[] { ';' };
-
-        string fogbugzServiceUri;
-        string userEmail;
-        string userPassword;
         string caseFile;
         string attachmentDirectory;
 
-        bool m_seenResolve;
-        bool m_seenClose;
-
-        string m_lastBug;
-        string m_token;
-        Dictionary<string, string> m_people = new Dictionary<string, string>();
-        StringBuilder m_log;
-
         Mime mimeDetector = new Mime();
+        FogBugzDriver driver;
 
-        public Importer(string fogbugzServiceUri, string fogbugzUserEmail, string fogbugzUserPassword, string caseFile, string attachmentDirectory)
+        /// <summary>
+        /// Gets or sets the attachment separators.
+        /// </summary>
+        /// <value>The attachment separators.</value>
+		public char[] AttachmentSeparators { get; set; } = { ';' };
+
+        public Importer(FogBugzDriver driver, string caseFile, string attachmentDirectory)
         {
-            this.fogbugzServiceUri = fogbugzServiceUri;
-            this.userEmail = fogbugzUserEmail;
-            this.userPassword = fogbugzUserPassword;
+            this.driver = driver;
             this.caseFile = caseFile;
             this.attachmentDirectory = attachmentDirectory;
         }
 
-        public void Connect()
+        public async Task ImportAsync()
         {
-            Dictionary<string, string> args = new Dictionary<string, string>();
-            args.Add("cmd", "logon");
-            args.Add("email", userEmail);
-            args.Add("password", userPassword);
-
-            string result = CallRESTAPIFiles(fogbugzServiceUri, args, null);
-
-            try
-            {
-                XmlTextReader reader = new XmlTextReader(new StringReader(result));
-                XPathDocument doc = new XPathDocument(reader);
-                XPathNavigator nav = doc.CreateNavigator();
-
-                m_token = nav.Evaluate("string(response/token)").ToString();
-
-            } catch (Exception ex){
-                Console.WriteLine($"Exception connecting to FogBugz: {ex}");
-                return;
-            }
-
-            loadPeople();
-        }
-
-        public void Import()
-        {
-            m_log = new StringBuilder();
-
             FileInfo existingFile = new FileInfo(caseFile);
             using (var fileReader = new StreamReader(existingFile.OpenRead()))
             {
                 using (var csvReader = new CsvReader(fileReader))
-                {                    
+                {
                     List<string> headers = null;
-                    if (csvReader.ReadHeader()){
+                    if (csvReader.ReadHeader())
+                    {
                         headers = csvReader.FieldHeaders.ToList();
-                    } else {
+                    }
+                    else
+                    {
                         Console.WriteLine("Could not read headers. Exiting");
                         return;
                     }
@@ -95,150 +64,195 @@ namespace FogBugzImporter
                     {
                         var record = csvReader.CurrentRecord;
 
-                        var case = new Dictionary<String, String>(headers.Zip(record, (k, v) => new KeyValuePair<String, String>(k, v))
+                        var fogBugzCase = new Dictionary<String, String>(headers.Zip(record, (k, v) => new KeyValuePair<String, String>(k, v))
                                                                 .Where(kp => !String.IsNullOrWhiteSpace((kp.Value))));
-                        
-			  
-                        //Dumb version:
-                        //var ticketMap = Enumerable.Range(0, headerCount).ToDictionary(i => headers[i], i => record[i]);
+
+						if (fogBugzCase.TryGetValue("ixPersonAssignedTo", out var assignee))
+						{
+							if (!int.TryParse(assignee, out var _))
+							{
+								fogBugzCase.Remove("ixPersonAssignedTo");
+								string personId = driver.GetPersonId(assignee);
+								if (!string.IsNullOrEmpty(personId))
+								{
+									fogBugzCase.Add("ixPersonAssignedTo", personId);
+								}
+								else
+								{
+									Console.WriteLine($"Unable to look up personId for {assignee}");
+								}
+							}
+						}
+
+						if (fogBugzCase.TryGetValue("ixPersonEditedBy", out var reporter))
+						{
+							if (!int.TryParse(reporter, out var _))
+							{
+								fogBugzCase.Remove("ixPersonEditedBy");
+								string personId = driver.GetPersonId(reporter);
+								if (!string.IsNullOrEmpty(personId))
+								{
+									fogBugzCase.Add("ixPersonEditedBy", personId);
+								}
+								else
+								{
+									Console.WriteLine($"Unable to look up personId for {reporter}");
+								}
+							}
+						}
+
+						List<Dictionary<string, byte[]>> attachmentData = null;
+						if (fogBugzCase.TryGetValue("attachments", out var attachments))
+						{
+                            fogBugzCase.Remove("attachments");
+							List<Attachment> files = GetAttachments(attachments);
+							ASCIIEncoding encoding = new ASCIIEncoding();
+
+							if (files.Count > 0)
+							{
+                                attachmentData = new List<Dictionary<string, byte[]>>(files.Count);
+								for (int i = 0; i < files.Count; i++)
+								{
+									attachmentData[i] = new Dictionary<string, byte[]>();
+									attachmentData[i]["name"] = encoding.GetBytes("File" + (i + 1).ToString());
+									attachmentData[i]["filename"] = encoding.GetBytes(files[i].name);
+									attachmentData[i]["contenttype"] = encoding.GetBytes(mimeDetector.Lookup(files[i].name));
+                                    using (FileStream fs = new FileStream(Path.Combine(attachmentDirectory, files[i].nameOnDisk), FileMode.Open))
+                                    {
+                                        BinaryReader br = new BinaryReader(fs);
+                                        attachmentData[i]["data"] = br.ReadBytes((int)fs.Length);                                        
+                                    }
+								}
+                                fogBugzCase.Add("nFileCount", files.Count.ToString());
+							}
+						}
+
+                        await driver.ExecuteCommandAsync(fogBugzCase, attachmentData);
                     }
-                    /*
-                    int row = 2;
+                }
+            }
+        }
 
-                    string cmd = getCellValue(worksheet, row, 1);
-                    while (!string.IsNullOrEmpty(cmd))
+        List<Attachment> GetAttachments(string attachments)
+		{
+			List<Attachment> result = new List<Attachment>();
+
+			if (!string.IsNullOrEmpty(attachments))
+			{
+				string[] splitResult = attachments.Split(AttachmentSeparators, StringSplitOptions.RemoveEmptyEntries);
+				for (int i = 0; i < splitResult.Length;)
+				{
+					Attachment a = new Attachment();
+					a.name = splitResult[i++];
+					a.nameOnDisk = Path.GetFileName(splitResult[i++]);
+					result.Add(a);
+				}
+			}
+
+			return result;
+		}
+
+
+	}
+
+    /// <summary>
+    /// FogBugz API driver.
+    /// </summary>
+    class FogBugzDriver {
+
+		string fogbugzServiceUri;
+		string userEmail;
+		string userPassword;
+		string fogbugzToken;
+		Dictionary<string, string> nameToPersonIdMap = new Dictionary<string, string>();
+
+        /// <summary>
+        /// Gets a value indicating whether this <see cref="T:FogBugzImporter.FogBugzDriver"/> has connected to FogBugz.
+        /// </summary>
+        /// <value><c>true</c> if it has connected; otherwise, <c>false</c>.</value>
+        public bool HasConnected { get; private set; }
+
+		public FogBugzDriver(string fogbugzServiceUri, string fogbugzUserEmail, string fogbugzUserPassword)
+		{
+			this.fogbugzServiceUri = fogbugzServiceUri;
+			userEmail = fogbugzUserEmail;
+			userPassword = fogbugzUserPassword;
+		}
+
+		public FogBugzDriver(string fogbugzServiceUri, string fogbugzApiToken)
+		{
+			this.fogbugzServiceUri = fogbugzServiceUri;
+			fogbugzToken = fogbugzApiToken;
+		}
+
+		public async Task ConnectAsync()
+		{
+			if (String.IsNullOrWhiteSpace(fogbugzToken))
+			{
+				fogbugzToken = await RetrieveApiTokenAsync();
+			}
+            nameToPersonIdMap = await RetrievePeopleIdsAsync();
+            HasConnected = true;
+		}
+
+        /// <summary>
+        /// Executes the command.
+        /// </summary>
+        /// <returns>The BugzId of the case operated upon, when available.</returns>
+        /// <param name="caseData">Case data.</param>
+        /// <param name="attachments">Attachments.</param>
+        public async Task<int?> ExecuteCommandAsync(Dictionary<String,String> caseData, List<Dictionary<string, byte[]>> attachments)
+        {
+            String cmd;
+            if (!caseData.TryGetValue("cmd", out cmd))
+            {
+                throw new InvalidDataException("A cmd value must be provided");
+            }
+
+            caseData.Add("token", fogbugzToken);
+
+            string result = await CallRESTAPIFiles(fogbugzServiceUri, caseData, attachments);
+            switch (cmd)
+            {
+                case "new":
+                case "edit":
+                case "assign":
+                case "resolve":
+                case "reactivate":
+                case "close":
+                case "reopen":
+                    XmlTextReader reader = new XmlTextReader(new StringReader(result));
+                    XPathDocument doc = new XPathDocument(reader);
+                    XPathNavigator nav = doc.CreateNavigator();
+                    var bugzIdStr = nav.Evaluate("string(response/case/@ixBug)")?.ToString();
+                    if (bugzIdStr != null && !String.IsNullOrWhiteSpace(bugzIdStr))
                     {
-                        string dt = getCellValue(worksheet, row, 2);
-                        string sProject = getCellValue(worksheet, row, 3);
-                        string sArea = getCellValue(worksheet, row, 4);
-                        string sFixFor = getCellValue(worksheet, row, 5);
-                        string ixPriority = getCellValue(worksheet, row, 6);
-                        string sTitle = getCellValue(worksheet, row, 7);
-                        string sEvent = getCellValue(worksheet, row, 8);
-                        string sPersonAssignedTo = getCellValue(worksheet, row, 9);
-                        string dtDue = getCellValue(worksheet, row, 10);
-                        string reporter = getCellValue(worksheet, row, 11);
-                        string attachments = null;//getCellValue(worksheet, row, 12);
-
-                        if (cmd == "close" && !m_seenResolve)
-                            executeCommand("resolve", dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
-
-                        if (cmd == "reopen" && !m_seenClose)
-                            cmd = "reactivate";
-
-                        //executeCommand(cmd, dt, sProject, sArea, sFixFor, ixPriority, sTitle, sEvent, sPersonAssignedTo, dtDue, reporter, attachments);
-
-                        Console.WriteLine(string.Format("Processed {0} row", row));
-
-                        row++;
-                        cmd = getCellValue(worksheet, row, 1);
-                    }*/
-                }
+                        if (int.TryParse(bugzIdStr, out var bugzId)){
+                            return bugzId;
+                        }
+                    }
+                    return null;
+                default:
+                    return null;
             }
-
-            File.WriteAllText("log.xml", m_log.ToString(), Encoding.Unicode);
         }
 
-		/*private void executeCommand(string cmd, string dt, string sProject, string sArea, string sFixFor,
-            string ixPriority, string sTitle, string sEvent, string sPersonAssignedTo, string dtDue,
-            string reporter, string attachments)
-            */
-        void executeCommand(Dictionary<String,String> caseData)
+        public string GetPersonId(string person)
         {
-            var cmd = caseData["cmd"];
-            if (cmd != "new" && string.IsNullOrEmpty(m_lastBug))
-                throw new InvalidOperationException("Possibly invalid tickets file.");
-
-            caseData.Add("token", m_token);
-
-            if (cmd != "new")
-                caseData.Add("ixBug", m_lastBug);
-
-            var reporter = caseData["reporter"];
-            caseData.Remove("reporter");
-            string personId = getPersonId(reporter);
-            if (!string.IsNullOrEmpty(personId))
-                caseData.Add("ixPersonEditedBy", personId);
-
-            var attachments = caseData["attachments"];
-            caseData.Remove("attachments");
-            List<Attachment> files = getAttachments(attachments);
-            ASCIIEncoding encoding = new ASCIIEncoding();
-            Dictionary<string, byte[]>[] rgFiles = null;
-            if (files.Count > 0)
-            {
-                rgFiles = new Dictionary<string, byte[]>[files.Count];
-                for (int i = 0; i < files.Count; i++)
-                {
-                    rgFiles[i] = new Dictionary<string, byte[]>();
-                    rgFiles[i]["name"] = encoding.GetBytes("File" + (i + 1).ToString());
-                    rgFiles[i]["filename"] = encoding.GetBytes(files[i].name);
-                    rgFiles[i]["contenttype"] = encoding.GetBytes(mimeDetector.Lookup(files[i].name));
-                    FileStream fs = new FileStream(Path.Combine(attachmentDirectory, files[i].nameOnDisk), FileMode.Open);
-                    BinaryReader br = new BinaryReader(fs);
-                    rgFiles[i]["data"] = br.ReadBytes((int)fs.Length);
-                    fs.Close();
-                }
-                caseData.Add("nFileCount", files.Count.ToString());
-            }
-
-            string result = CallRESTAPIFiles(fogbugzServiceUri, caseData, rgFiles);
-            if (cmd == "new")
-            {
-                XmlTextReader reader = new XmlTextReader(new StringReader(result));
-                XPathDocument doc = new XPathDocument(reader);
-                XPathNavigator nav = doc.CreateNavigator();
-                m_lastBug = nav.Evaluate("string(response/case/@ixBug)").ToString();
-                m_seenResolve = false;
-                m_seenClose = false;
-            }
-            else if (cmd == "resolve")
-                m_seenResolve = true;
-            else if (cmd == "close")
-                m_seenClose = true;
-            else if (cmd == "reopen" || cmd == "reactivate")
-            {
-                m_seenClose = false;
-                m_seenResolve = false;
-            }
-
-            m_log.Append(result);
-        }
-
-        private List<Attachment> getAttachments(string attachments)
-        {
-            List<Attachment> result = new List<Attachment>();
-
-            if (!string.IsNullOrEmpty(attachments))
-            {
-                string[] splitResult = attachments.Split(m_attachmentSeparator, StringSplitOptions.RemoveEmptyEntries);
-                for (int i = 0; i < splitResult.Length; )
-                {
-                    Attachment a = new Attachment();
-                    a.name = splitResult[i++];
-                    a.nameOnDisk = Path.GetFileName(splitResult[i++]);
-                    result.Add(a);
-                }
-            }
-
-            return result;
-        }
-
-        private string getPersonId(string person)
-        {
-            if (m_people.ContainsKey(person))
-                return m_people[person];
+            if (nameToPersonIdMap.ContainsKey(person))
+                return nameToPersonIdMap[person];
 
             return null;
         }
 
-        private void loadPeople()
+        async Task<Dictionary<string, string>> RetrievePeopleIdsAsync()
         {
-            Dictionary<string, string> args = new Dictionary<string, string>();
+            var nameToIdMap = new Dictionary<string, string>();
+            var args = new Dictionary<string, string>();
             args.Add("cmd", "listPeople");
-            args.Add("token", m_token);
+            args.Add("token", fogbugzToken);
 
-            string result = CallRESTAPIFiles(fogbugzServiceUri, args, null);
+            string result = await CallRESTAPIFiles(fogbugzServiceUri, args, null);
             XmlTextReader reader = new XmlTextReader(new StringReader(result));
             XPathDocument doc = new XPathDocument(reader);
             XPathNavigator nav = doc.CreateNavigator();
@@ -250,21 +264,39 @@ namespace FogBugzImporter
             XPathNodeIterator nl = (XPathNodeIterator)nav.Evaluate(resultsTag);
             foreach (System.Xml.XPath.XPathNavigator n in nl)
             {
-                m_people.Add(
+                nameToIdMap.Add(
                     n.Evaluate("string(" + sName + ")").ToString(),
                     n.Evaluate("string(" + ixName + ")").ToString());
             }
+
+            return nameToIdMap;
         }
+
+        async Task<string> RetrieveApiTokenAsync()
+        {
+			Dictionary<string, string> args = new Dictionary<string, string>();
+			args.Add("cmd", "logon");
+			args.Add("email", userEmail);
+			args.Add("password", userPassword);
+
+			string result = await CallRESTAPIFiles(fogbugzServiceUri, args, null);
+
+			XmlTextReader reader = new XmlTextReader(new StringReader(result));
+			XPathDocument doc = new XPathDocument(reader);
+			XPathNavigator nav = doc.CreateNavigator();
+
+			return nav.Evaluate("string(response/token)").ToString();
+		}
 
         //
         // CallRestAPIFiles submits an API request to the FogBugz api using the 
         // multipart/form-data submission method (so you can add files)
         // Don't forget to include nFileCount in your rgArgs collection if you are adding files.
         //
-        private string CallRESTAPIFiles(string sURL, Dictionary<string, string> rgArgs, Dictionary<string, byte[]>[] rgFiles)
+        async Task<string> CallRESTAPIFiles(string sURL, Dictionary<string, string> rgArgs, IEnumerable<Dictionary<string, byte[]>> rgFiles)
         {
 
-            string sBoundaryString = getRandomString(30);
+            string sBoundaryString = GetRandomString(30);
             string sBoundary = "--" + sBoundaryString;
             ASCIIEncoding encoding = new ASCIIEncoding();
             UTF8Encoding utf8encoding = new UTF8Encoding();
@@ -279,7 +311,7 @@ namespace FogBugzImporter
             //
             // add all the normal arguments
             //
-            foreach (System.Collections.Generic.KeyValuePair<string, string> i in rgArgs)
+            foreach (KeyValuePair<string, string> i in rgArgs)
             {
                 parts.Enqueue(encoding.GetBytes(sBoundary + vbCrLf));
                 parts.Enqueue(encoding.GetBytes("Content-Type: text/plain; charset=\"utf-8\"" + vbCrLf));
@@ -326,33 +358,31 @@ namespace FogBugzImporter
             // write the post
             //
             Stream stream = http.GetRequestStream();
-            string sent = "";
             foreach (Byte[] part in parts)
             {
-                stream.Write(part, 0, part.Length);
-                sent += encoding.GetString(part);
+                await stream.WriteAsync(part, 0, part.Length);
             }
             stream.Close();
-            //txtSent.Text = sent;
 
             //
             // read the result
             //
-            Stream r = http.GetResponse().GetResponseStream();
-            StreamReader reader = new StreamReader(r);
-            string retValue = reader.ReadToEnd();
-            //txtReceived.Text = retValue;
-            reader.Close();
+            string retValue;
+            var response = await http.GetResponseAsync();
+            using (Stream r = response.GetResponseStream()) {
+                StreamReader reader = new StreamReader(r);
+                retValue = await reader.ReadToEndAsync();
+            }
 
             return retValue;
         }
 
-        private string getRandomString(int nLength)
+        string GetRandomString(int length)
         {
             string chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXTZabcdefghiklmnopqrstuvwxyz";
             string s = "";
             System.Random rand = new System.Random();
-            for (int i = 0; i < nLength; i++)
+            for (int i = 0; i < length; i++)
             {
                 int rnum = (int)Math.Floor((double)rand.Next(0, chars.Length - 1));
                 s += chars.Substring(rnum, 1);
